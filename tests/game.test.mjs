@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRoom, act, view, tick, spinningLetter, eligible} from '../lib/game/engine.mjs';
+import {canAccept,isLosingPlayer} from '../lib/game/word-rules.mjs';
 import {handleGame} from '../lib/game/service.mjs';
 function setup(rounds=1){const {room,token}=createRoom('ABC234',{name:'Jaya',rounds,seconds:30},1000);const second=act(room,'',{action:'join',name:'Anurag'},1001);return{room,token,second};}
 const full = room => Object.fromEntries(['name','place','animal','thing'].map(k=>[k,room.letter+'bc']));
@@ -38,7 +39,7 @@ test('simultaneous complete submissions have exactly one winner and preserve oth
 
 test('lenient matching treats local, Indian and foreign names equally across casing and accents',()=>{
  for(const name of ['anurag','ANURAG','AnUrAg','  anurag  ','Aarav','A. P. J. Abdul Kalam','Anne-Marie','Álvaro']) assert(eligible(name,'A'),name);
- for(const [word,letter] of [['Élodie','E'],['e\u0301lodie','E'],['Özlem','O'],['Łukasz','L'],['O’Connor','O'],['New Delhi','N'],['R2-D2','R']])assert(eligible(word,letter),word);
+ for(const [word,letter] of [['Élodie','E'],['e\u0301lodie','E'],['Özlem','O'],['Łukasz','L'],['O’Connor','O'],['New Delhi','N'],['R2-Droid','R']])assert(eligible(word,letter),word);
  assert(!eligible('Anurag','B'));assert(!eligible('123','A'));assert(!eligible('  ','A'));
 });
 test('native-script names can be approved by host without automatic transliteration guesses',()=>{
@@ -85,4 +86,47 @@ test('a submission at the timer deadline is rejected and saved drafts are review
  run(room,token,'save',{answers:{name:room.letter+'bc'},sequence:1});
  assert.throws(()=>run(room,token,'submit',{answers:full(room),sequence:2},room.deadline),e=>e.status===409);
  assert.equal(room.phase,'review');assert.equal(room.stoppedBy,null);assert.equal(view(room,token,room.deadline).pendingPoints[room.host],10);
+});
+
+test('fewer than three letters earn zero and cannot be approved',()=>{
+ const {room,token}=setup();run(room,token,'begin');run(room,token,'start');run(room,token,'stop');
+ const short=room.letter+'b';
+ run(room,token,'submit',{answers:{...full(room),name:short,thing:room.letter+'--1'},sequence:1});
+ assert.equal(view(room,token).pendingPoints[room.host],20);
+ assert.throws(()=>run(room,token,'judge',{playerId:room.host,category:'name',accept:true}));
+ for(const word of ['Al','A-b','R2-D2','é','é','ओम'])assert.equal(canAccept(word,word[0]),false,word);
+ assert(eligible('Ali','A'));assert(canAccept('अनुराग','A'));
+});
+test('host edits settings before play and between rounds, never during writing',()=>{
+ const {room,token,second}=setup(3);
+ assert.throws(()=>run(room,second,'settings',{rounds:4,seconds:75}),/host/);
+ run(room,token,'settings',{rounds:4,seconds:75});
+ assert.deepEqual(room.settings,{rounds:4,seconds:75});
+ run(room,token,'begin');run(room,token,'start');run(room,token,'stop');
+ assert.equal(room.deadline,1010+75000);
+ assert.throws(()=>run(room,token,'settings',{rounds:5,seconds:90}),/between rounds/);
+ run(room,token,'submit',{answers:full(room),sequence:1});
+ for(const settings of [{rounds:27,seconds:60},{rounds:0,seconds:60},{rounds:4,seconds:0}])assert.throws(()=>run(room,token,'settings',settings));
+ run(room,token,'settings',{rounds:2,seconds:37});run(room,token,'next');
+ run(room,second,'start');run(room,second,'stop');assert.equal(room.deadline,1010+37000);
+ run(room,token,'submit',{answers:full(room),sequence:1});
+ assert.throws(()=>run(room,token,'settings',{rounds:1,seconds:37}));
+ run(room,token,'next');assert.equal(room.phase,'finished');
+});
+test('custom numeric and letter codes join correctly and collisions do not replace a room',async()=>{
+ const rooms=new Map();
+ const store={insert:async r=>{if(rooms.has(r.code))return false;rooms.set(r.code,structuredClone(r));return true},get:async code=>structuredClone(rooms.get(code)),compareAndSet:async(r,v)=>{if(rooms.get(r.code).revision!==v)return false;rooms.set(r.code,structuredClone(r));return true}};
+ const input={action:'create',name:'Jaya',rounds:3,seconds:60,customCode:'001234'};
+ const created=await handleGame(store,input);assert.equal(created.room.code,'001234');
+ const joined=await handleGame(store,{action:'join',code:'001234',name:'Anurag'});assert.equal(joined.room.players.length,2);
+ await assert.rejects(()=>handleGame(store,input),e=>e.status===409);
+ assert.equal(rooms.get('001234').players.length,2);
+ assert.equal((await handleGame(store,{...input,customCode:'family'})).room.code,'FAMILY');
+ for(const customCode of ['123','1234567','AB CD!'])await assert.rejects(()=>handleGame(store,{...input,customCode}));
+});
+test('meme audience includes only last place, handles ties and rematches',()=>{
+ const room={phase:'finished',me:'a',players:[{id:'a',total:10},{id:'b',total:40},{id:'c',total:10}]};
+ assert(isLosingPlayer(room));assert(isLosingPlayer({...room,me:'c'}));assert(!isLosingPlayer({...room,me:'b'}));
+ assert(!isLosingPlayer({...room,phase:'lobby'}));
+ assert(!isLosingPlayer({...room,players:room.players.map(p=>({...p,total:10}))}));
 });
